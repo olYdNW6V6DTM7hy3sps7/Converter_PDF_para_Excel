@@ -194,10 +194,9 @@ def extract_tables_from_pdf(pdf_bytes: bytes) -> List[Tuple[pd.DataFrame, str]]:
 
         for page_index, page in enumerate(pdf.pages, start=1):
             try:
-                # USA O PARÂMETRO COLUMNS PARA EXTRAÇÃO FIXA
-                # Isso ignora as regras de detecção de linhas e texto (vertical_strategy)
-                # e força a separação da coluna "Turma" e a captura das 129 linhas.
-                tables = page.extract_tables(table_settings={"columns": FIXED_COLUMN_COORDINATES}) or []
+                # CORREÇÃO FINAL DE COMPATIBILIDADE:
+                # Passa 'columns' diretamente para a função, em vez de dentro de 'table_settings'.
+                tables = page.extract_tables(columns=FIXED_COLUMN_COORDINATES) or []
             except Exception as e:
                 logger.exception("Unhandled error during PDF parsing and table extraction.")
                 # Se o erro for de configuração, levantamos uma exceção 500 para não retornar 422
