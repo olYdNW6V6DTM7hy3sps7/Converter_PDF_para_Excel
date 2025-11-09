@@ -1,6 +1,4 @@
-# Multi-stage build to keep the final image small and secure.
-
-# 1) Builder stage: install dependencies into a staging dir
+# Multi-stage build para imagem pequena e segura
 FROM python:3.11-slim AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -9,8 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# System deps only if needed for building; pandas/openpyxl/pdfplumber ship wheels typically.
-# Keep minimal. Add build-essential only if compilation is required.
+# Dependências de build (mantenha mínimo; remova se não precisar)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
@@ -18,27 +15,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
-# 2) Runtime stage: copy Python deps, create non-root user
 FROM python:3.11-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Create non-root user
+# Usuário não-root
 RUN adduser --disabled-password --gecos "" appuser
-
 WORKDIR /app
 
-# Copy installed site-packages from builder
+# Copia libs instaladas
 COPY --from=builder /install /usr/local
 
-# Copy application code
+# Copia app
 COPY main.py /app/main.py
 COPY requirements.txt /app/requirements.txt
 
 USER appuser
 
+# Expor porta padrão local; no Render usaremos $PORT
 EXPOSE 8000
 
-# Use uvicorn in production (can tune workers based on CPU and workload)
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Permite sobrescrever via env (Render define $PORT)
+# WORKERS é opcional para concorrer melhor em instâncias maiores
+ENV PORT=8000
+ENV WORKERS=1
+
+# Use sh -c para expandir variáveis de ambiente
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT} --workers ${WORKERS}"]
