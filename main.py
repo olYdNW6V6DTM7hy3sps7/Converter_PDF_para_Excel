@@ -49,13 +49,12 @@ INVALID_SHEET_CHARS = r'[:\\/*?\[\]]'
 MANUAL_CLEAN_HEADERS = ["Turma", "Aluno", "Telefone", "Responsável"]
 NUM_DATA_COLUMNS = len(MANUAL_CLEAN_HEADERS) - 1 # 3 colunas de dados
 
-# Coordenadas X para agrupamento (banding) baseadas no seu PDF (listas_completas_v2.pdf)
-# O texto é separado por coordenada X: [Left boundary, Column 1 split, Column 2 split, Right boundary]
-# [0] = Início, [1] = Fim do Aluno/Início do Telefone, [2] = Fim do Telefone/Início do Responsável, [3] = Fim do Responsável
-COLUMN_BANDING_X = [20, 200, 310, 580] # Valores ajustados para o seu PDF.
+# Regex projetada para capturar os 3 grupos de dados do seu PDF
+# Padrão: "Aluno","Telefone","Responsável"
+# Captura o texto entre aspas, permitindo caracteres especiais nos grupos
+# A regex é complexa para lidar com as aspas duplas, quebras de linha e vírgulas.
+DATA_ROW_REGEX = re.compile(r'"\s*([^"]+?)\s*"\s*,\s*"(\(31\)[^"]+?|\s*Não\s*informou\s*)"\s*,\s*"([^"]+?)"')
 
-# Regex para limpar ruído (aspas, quebras de linha, símbolos não essenciais)
-CLEAN_TEXT_REGEX = re.compile(r'[^a-zA-Z0-9\s\(\)\-\+\.\sáéíóúÁÉÍÓÚãõÃÕçÇ:]')
 
 # ------------------------------------------------------------------------------
 # Configuration from Environment
@@ -143,22 +142,20 @@ def iter_bytesio(buf: io.BytesIO, chunk_size: int = 1024 * 1024) -> Iterable[byt
         yield chunk
 
 
-def _get_column_index(x_coord: float) -> int:
+def _pad_or_truncate(row: List[object] | None, size: int) -> List[object]:
     """
-    Determina o índice da coluna (0, 1, ou 2) com base na coordenada X.
+    Ensure each row has exactly 'size' columns.
     """
-    if COLUMN_BANDING_X[0] <= x_coord < COLUMN_BANDING_X[1]:
-        return 0  # Aluno
-    elif COLUMN_BANDING_X[1] <= x_coord < COLUMN_BANDING_X[2]:
-        return 1  # Telefone
-    elif COLUMN_BANDING_X[2] <= x_coord < COLUMN_BANDING_X[3]:
-        return 2  # Responsável
-    return -1 # Fora da área de interesse
-
+    r = list(row) if row is not None else []
+    if len(r) < size:
+        r.extend([None] * (size - len(r)))
+    elif len(r) > size:
+        r = r[:size]
+    return r
 
 def extract_tables_from_pdf(pdf_bytes: bytes) -> List[Tuple[pd.DataFrame, str]]:
     """
-    Extrai dados do PDF usando coordenadas de palavras (abordagem "pixel a pixel").
+    Extrai dados do PDF usando a extração de texto e Regex para forçar a estrutura.
     """
     results: List[Tuple[pd.DataFrame, str]] = []
     
@@ -172,79 +169,55 @@ def extract_tables_from_pdf(pdf_bytes: bytes) -> List[Tuple[pd.DataFrame, str]]:
             class_name = ""
             sheet_name_base = f"Page_{page_index}"
             
-            # Extrai o texto da área superior onde o nome da turma geralmente está
             try:
-                # Cria um corte na parte superior da página (Y=0 a Y=70)
+                # Extrai o texto da área superior (Y=0 a Y=70) para a Turma
                 top_area = page.crop((0, 0, page.width, 70)) 
                 top_text = top_area.extract_text().strip()
                 
                 if top_text:
-                    # Tenta encontrar a linha que se parece com o nome de uma turma ("3º NomeDaTurma")
                     match_turma = re.search(r"^\dº\s+(.*)", top_text)
                     if match_turma:
+                        # Pega o primeiro segmento do nome da turma (ex: "Segurança" de "3º Segurança")
                         class_name = match_turma.group(1).strip().split('\n')[0].strip()
                         sheet_name_base = class_name
             except Exception:
-                 # Se o corte falhar, a turma fica em branco
                 pass
             
-            # 2. Extrair todas as palavras com coordenadas e agrupá-las por linha (Y) e coluna (X)
-            
-            # words: lista de dicionários com 'text', 'x0', 'y0', 'x1', 'y1', 'doctop', 'top', 'bottom'
-            words = page.extract_words(keep_blank_chars=False)
-            
-            # Agrupar as palavras pela coordenada Y (linha)
-            rows: Dict[int, List[Dict]] = {}
-            for word in words:
-                # Usa a coordenada Y do topo para definir a linha
-                y_coord = int(word["top"]) 
+            # 2. Extrair o texto da área de dados (excluindo a área superior e o rodapé)
+            # Y=70 é logo abaixo do cabeçalho da tabela ruidoso.
+            # Y=page.height - 20 (margem do rodapé)
+            try:
+                data_area = page.crop((0, 70, page.width, page.height)) 
+                page_text = data_area.extract_text(layout=True)
+            except Exception:
+                page_text = ""
                 
-                # Ignora texto na área superior (onde está o nome da turma e o cabeçalho ruidoso)
-                if y_coord < 70: 
-                    continue
-                    
-                if y_coord not in rows:
-                    rows[y_coord] = []
-                rows[y_coord].append(word)
+            if not page_text:
+                continue
+                
+            # 3. Limpeza do texto bruto para facilitar a Regex
+            # Remove as quebras de linha que não estão entre aspas duplas, pois o PDF tem quebras de linha dentro das células.
+            # Este é o ponto mais crítico e a razão dos erros anteriores.
+            clean_text = re.sub(r'(?<!")\s*\n\s*(?!")', ' ', page_text)
+            
+            # 4. Extração de dados usando a Regex Agressiva
+            # Encontra todos os registros de dados que correspondem ao padrão: "Aluno","Telefone","Responsável"
+            data_matches = DATA_ROW_REGEX.findall(clean_text)
+            
+            data_rows = []
+            if data_matches:
+                for match in data_matches:
+                    # O match já retorna 3 grupos (Aluno, Telefone, Responsável)
+                    cleaned_row = [item.strip() for item in match]
+                    data_rows.append(cleaned_row)
 
             
-            extracted_data = []
-
-            # 3. Processar cada linha de palavras
-            for y_coord in sorted(rows.keys()):
-                
-                # Inicializa a linha com 3 strings vazias (Aluno, Telefone, Responsável)
-                current_row = [""] * NUM_DATA_COLUMNS
-                
-                # Ordena as palavras dentro da linha pela coordenada X
-                words_in_row = sorted(rows[y_coord], key=lambda w: w["x0"])
-                
-                # Itera sobre as palavras e as insere na coluna correta
-                for word in words_in_row:
-                    col_index = _get_column_index(word["x0"])
-                    
-                    if col_index != -1:
-                        # Adiciona a palavra à string da coluna, separada por espaço
-                        if current_row[col_index]:
-                            current_row[col_index] += " " + word["text"]
-                        else:
-                            current_row[col_index] = word["text"]
-
-                # Limpeza final e adiciona aos dados extraídos
-                if any(current_row): # Se a linha não estiver completamente vazia
-                    # Remove o ruído (aspas, vírgulas, quebras de linha que sobraram, etc.)
-                    cleaned_row = [CLEAN_TEXT_REGEX.sub('', cell).strip() for cell in current_row]
-                    
-                    # Certifica-se de que o primeiro campo (Aluno) não é o cabeçalho ruidoso
-                    if cleaned_row[0] and cleaned_row[0].lower() not in ["aluno", "responsável", "telefone"]:
-                         extracted_data.append(cleaned_row)
-
-            
-            if not extracted_data:
+            if not data_rows:
+                logger.warning(f"Regex não encontrou dados para Turma: {class_name if class_name else f'Página {page_index}'}. A Turma provavelmente está vazia.")
                 continue
 
-            # 4. Criar o DataFrame
-            df = pd.DataFrame(extracted_data, columns=MANUAL_CLEAN_HEADERS[1:])
+            # 5. Criar o DataFrame
+            df = pd.DataFrame(data_rows, columns=MANUAL_CLEAN_HEADERS[1:])
 
             # Adiciona a coluna 'Turma' (Class Name) como a primeira coluna
             df.insert(0, "Turma", class_name if class_name else f"Página {page_index}")
@@ -256,7 +229,6 @@ def extract_tables_from_pdf(pdf_bytes: bytes) -> List[Tuple[pd.DataFrame, str]]:
             results.append((df, sheet_name_base))
 
     return results
-
 
 # ------------------------------------------------------------------------------
 # Routes (Restante do código da API permanece o mesmo)
