@@ -45,6 +45,20 @@ EXCEL_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.
 ATTACHMENT_FILENAME = "converted_output.xlsx"
 INVALID_SHEET_CHARS = r'[:\\/*?\[\]]'
 
+# Configurações otimizadas para detecção de tabelas.
+# Usa estratégia 'text' para tabelas sem bordas ou com formatação irregular,
+# melhorando a detecção de colunas (como a 'Turma').
+TABLE_SETTINGS_OPTIMIZED = {
+    "vertical_strategy": "text",  # Usa o alinhamento do texto para determinar as colunas
+    "horizontal_strategy": "text", # Usa o alinhamento do texto para determinar as linhas
+    "snap_tolerance": 3,
+    "snap_vertical": None,
+    "snap_horizontal": None,
+    "join_tolerance": 3,
+    "join_line_tol": 2,
+    "edge_min_length": 3,
+}
+
 # ------------------------------------------------------------------------------
 # Configuration from Environment
 # ------------------------------------------------------------------------------
@@ -178,7 +192,8 @@ def extract_tables_from_pdf(pdf_bytes: bytes) -> List[Tuple[pd.DataFrame, str]]:
 
         for page_index, page in enumerate(pdf.pages, start=1):
             try:
-                tables = page.extract_tables() or []
+                # Usa as configurações otimizadas para melhorar a detecção de tabelas
+                tables = page.extract_tables(TABLE_SETTINGS_OPTIMIZED) or []
             except Exception as e:
                 logger.exception("Failed to extract tables from page %s: %s", page_index, e)
                 continue
