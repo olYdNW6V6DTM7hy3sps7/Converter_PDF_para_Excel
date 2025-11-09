@@ -19,6 +19,7 @@ from __future__ import annotations
 import io
 import logging
 import re
+import os # Importação para ler variáveis de ambiente
 from typing import Generator, Iterable, List, Tuple
 
 import pandas as pd
@@ -26,6 +27,7 @@ import pdfplumber
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from starlette import status
+from fastapi.middleware.cors import CORSMiddleware # Importação para o CORS
 
 # ------------------------------------------------------------------------------
 # Logging
@@ -44,6 +46,28 @@ ATTACHMENT_FILENAME = "converted_output.xlsx"
 INVALID_SHEET_CHARS = r'[:\\/*?\[\]]'
 
 # ------------------------------------------------------------------------------
+# Configuration from Environment
+# ------------------------------------------------------------------------------
+# A variável de ambiente que armazenará os sites permitidos, separados por vírgula.
+# Exemplo: "https://site1.com,https://site2.org,http://localhost:3000"
+ALLOWED_ORIGINS_STRING = os.getenv("ALLOWED_ORIGINS")
+
+# Configura a lista de origens. Se a variável estiver definida, ela é transformada
+# em uma lista de strings. Caso contrário, a lista fica vazia, bloqueando o acesso
+# de qualquer origem cross-origin.
+if ALLOWED_ORIGINS_STRING:
+    # Divide a string por vírgulas e remove espaços em branco (strip)
+    origins = [o.strip() for o in ALLOWED_ORIGINS_STRING.split(',') if o.strip()]
+else:
+    origins = []
+
+if not origins:
+    logger.warning("A variável ALLOWED_ORIGINS não está definida ou está vazia. A API bloqueará todas as requisições cross-origin.")
+else:
+    logger.info(f"CORS configurado para as origens: {', '.join(origins)}")
+
+
+# ------------------------------------------------------------------------------
 # FastAPI app
 # ------------------------------------------------------------------------------
 app = FastAPI(
@@ -55,6 +79,19 @@ app = FastAPI(
     ),
     contact={"name": "Backend Team"},
     license_info={"name": "MIT"},
+)
+
+# ------------------------------------------------------------------------------
+# Middleware para Gerenciamento de CORS
+# ------------------------------------------------------------------------------
+# Este middleware verifica o cabeçalho 'Origin' da requisição.
+# Se a origem não estiver na lista 'origins', a requisição será bloqueada pelo navegador.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,       # A lista de origens permitidas (lida da variável de ambiente)
+    allow_credentials=True,      # Permite credenciais (cookies, cabeçalhos de autorização)
+    allow_methods=["*"],         # Permite todos os métodos (GET, POST, etc.)
+    allow_headers=["*"],         # Permite todos os cabeçalhos
 )
 
 
