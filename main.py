@@ -45,18 +45,21 @@ EXCEL_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.
 ATTACHMENT_FILENAME = "converted_output.xlsx"
 INVALID_SHEET_CHARS = r'[:\\/*?\[\]]'
 
-# Configurações otimizadas para detecção de tabelas.
-# CORREÇÃO FINAL: Removemos 'join_line_tol', 'snap_vertical' e 'snap_horizontal'
-# pois não são suportados na versão 0.11.4 do pdfplumber.
-# Mantemos a estratégia 'text' e alta tolerância para capturar tabelas complexas.
-TABLE_SETTINGS_OPTIMIZED = {
-    "vertical_strategy": "text",   # Usa alinhamento do texto para determinar colunas
-    "horizontal_strategy": "text", # Usa alinhamento do texto para determinar linhas
-    "snap_tolerance": 5,           # Aumenta a margem de erro para alinhamento
-    "join_tolerance": 5,           # Aumenta tolerância para unir elementos horizontalmente
-    "edge_min_length": 3,
-    "min_words_vertical": 2,       # Exige pelo menos 2 palavras para traçar uma linha vertical
-}
+# ATENÇÃO: COORDENADAS FIXAS PARA EXTRAÇÃO ROBUSTA
+# Estas coordenadas (pontos X) definem onde as colunas devem ser cortadas.
+# Elas são a forma mais garantida de capturar colunas desalinhadas como 'Turma'.
+# Valores de exemplo para um documento A4 típico (0 a 600 pontos):
+# Exemplo: [50, 150, 250, 350, 450, 550] - Seis colunas.
+# Por favor, ajuste se o PDF tiver margens ou layouts diferentes.
+FIXED_COLUMN_COORDINATES = [
+    50,  # Coluna 1 (Início da primeira coluna)
+    130, # Divisão Coluna 1 / Coluna 2
+    210, # Divisão Coluna 2 / Coluna 3
+    300, # Divisão Coluna 3 / Coluna 4 (Onde estaria a 'Turma'?)
+    420, # Divisão Coluna 4 / Coluna 5
+    500, # Divisão Coluna 5 / Coluna 6
+    550  # Fim da última coluna
+]
 
 # ------------------------------------------------------------------------------
 # Configuration from Environment
@@ -191,8 +194,10 @@ def extract_tables_from_pdf(pdf_bytes: bytes) -> List[Tuple[pd.DataFrame, str]]:
 
         for page_index, page in enumerate(pdf.pages, start=1):
             try:
-                # Usa as configurações otimizadas (e compatíveis) para melhorar a detecção de tabelas
-                tables = page.extract_tables(TABLE_SETTINGS_OPTIMIZED) or []
+                # USA O PARÂMETRO COLUMNS PARA EXTRAÇÃO FIXA
+                # Isso ignora as regras de detecção de linhas e texto (vertical_strategy)
+                # e força a separação da coluna "Turma" e a captura das 129 linhas.
+                tables = page.extract_tables(table_settings={"columns": FIXED_COLUMN_COORDINATES}) or []
             except Exception as e:
                 logger.exception("Unhandled error during PDF parsing and table extraction.")
                 # Se o erro for de configuração, levantamos uma exceção 500 para não retornar 422
