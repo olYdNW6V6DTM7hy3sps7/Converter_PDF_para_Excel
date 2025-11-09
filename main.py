@@ -1,0 +1,266 @@
+"""
+PDF ➜ Excel Converter API
+- Framework: FastAPI (async, validation, OpenAPI)
+- PDF parsing: pdfplumber
+- DataFrames: pandas
+- Excel writing: openpyxl (via pandas)
+- Processing: fully in-memory (io.BytesIO)
+- Endpoint: POST /api/v1/convert/pdf-to-excel
+
+Behavior:
+- Accepts a PDF via multipart/form-data (field "pdf_file")
+- Extracts all tables on all pages (each table -> separate sheet)
+- Returns a single .xlsx file as an attachment
+- Robust error handling with precise HTTP status codes
+"""
+
+from __future__ import annotations
+
+import io
+import logging
+import re
+from typing import Generator, Iterable, List, Tuple
+
+import pandas as pd
+import pdfplumber
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
+from starlette import status
+
+# ------------------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("pdf2xlsx")
+
+# ------------------------------------------------------------------------------
+# Constants
+# ------------------------------------------------------------------------------
+EXCEL_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+ATTACHMENT_FILENAME = "converted_output.xlsx"
+INVALID_SHEET_CHARS = r'[:\\/*?\[\]]'
+
+# ------------------------------------------------------------------------------
+# FastAPI app
+# ------------------------------------------------------------------------------
+app = FastAPI(
+    title="PDF to Excel Converter API",
+    version="1.0.0",
+    description=(
+        "Uploads a PDF, extracts all detected tables using pdfplumber, writes each table "
+        "to a separate Excel sheet, and returns the .xlsx file."
+    ),
+    contact={"name": "Backend Team"},
+    license_info={"name": "MIT"},
+)
+
+
+# ------------------------------------------------------------------------------
+# Utility functions
+# ------------------------------------------------------------------------------
+def is_probably_pdf(file_bytes: bytes) -> bool:
+    """
+    Validate content by checking the PDF magic header.
+    """
+    return file_bytes.startswith(b"%PDF-")
+
+
+def sanitize_sheet_name(name: str, used: set[str]) -> str:
+    """
+    Make a string a valid Excel sheet name and ensure uniqueness (<= 31 chars and no invalid chars).
+    """
+    sanitized = re.sub(INVALID_SHEET_CHARS, " ", name).strip() or "Sheet"
+    if len(sanitized) > 31:
+        sanitized = sanitized[:31]
+    base = sanitized
+    counter = 2
+    while sanitized in used:
+        suffix = f"_{counter}"
+        # Ensure length <= 31 including suffix
+        if len(base) + len(suffix) > 31:
+            sanitized = base[: 31 - len(suffix)] + suffix
+        else:
+            sanitized = base + suffix
+        counter += 1
+    used.add(sanitized)
+    return sanitized
+
+
+def iter_bytesio(buf: io.BytesIO, chunk_size: int = 1024 * 1024) -> Iterable[bytes]:
+    """
+    Stream a BytesIO in chunks to avoid duplicating memory.
+    """
+    buf.seek(0)
+    while True:
+        chunk = buf.read(chunk_size)
+        if not chunk:
+            break
+        yield chunk
+
+
+def _dedupe_columns(names: List[str]) -> List[str]:
+    """
+    Deduplicate column names while preserving order: ["A", "A", ""] -> ["A", "A_2", "Column"]
+    """
+    counts: dict[str, int] = {}
+    out: List[str] = []
+    for raw in names:
+        n = (raw or "").strip() or "Column"
+        counts[n] = counts.get(n, 0) + 1
+        if counts[n] > 1:
+            out.append(f"{n}_{counts[n]}")
+        else:
+            out.append(n)
+    return out
+
+
+def _pad_or_truncate(row: List[object] | None, size: int) -> List[object]:
+    """
+    Ensure each row has exactly 'size' columns.
+    """
+    r = list(row) if row is not None else []
+    if len(r) < size:
+        r.extend([None] * (size - len(r)))
+    elif len(r) > size:
+        r = r[:size]
+    return r
+
+
+def extract_tables_from_pdf(pdf_bytes: bytes) -> List[Tuple[pd.DataFrame, str]]:
+    """
+    Extract tables from each page of the PDF.
+    Returns a list of (DataFrame, desired_sheet_name).
+    """
+    results: List[Tuple[pd.DataFrame, str]] = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        if not pdf.pages:
+            return results
+
+        for page_index, page in enumerate(pdf.pages, start=1):
+            try:
+                tables = page.extract_tables() or []
+            except Exception as e:
+                logger.exception("Failed to extract tables from page %s: %s", page_index, e)
+                continue
+
+            for table_index, table in enumerate(tables, start=1):
+                if not table:
+                    continue
+
+                # Filter out fully empty rows
+                nonempty_rows = [
+                    row for row in table
+                    if row and any((cell is not None) and str(cell).strip() != "" for cell in row)
+                ]
+                if not nonempty_rows:
+                    continue
+
+                # Use the first row as header, which is the most practical general assumption.
+                header_raw = [str(c).strip() if c is not None else "" for c in nonempty_rows[0]]
+                header = _dedupe_columns(header_raw)
+
+                # Normalize each row to the header size and build DataFrame
+                normalized_rows = [_pad_or_truncate(row, len(header)) for row in nonempty_rows[1:]]
+                df = pd.DataFrame(normalized_rows, columns=header)
+
+                # Clean: drop fully empty rows/columns
+                df.replace(r"^\s*$", pd.NA, regex=True, inplace=True)
+                df.dropna(how="all", inplace=True)
+                df.dropna(axis=1, how="all", inplace=True)
+
+                # If data vanished (rare), keep at least the header-only dataframe
+                if df.empty:
+                    df = pd.DataFrame(columns=header)
+
+                sheet_name = f"Table_{table_index}_Page_{page_index}"
+                results.append((df, sheet_name))
+
+    return results
+
+
+# ------------------------------------------------------------------------------
+# Routes
+# ------------------------------------------------------------------------------
+@app.post(
+    "/api/v1/convert/pdf-to-excel",
+    summary="Convert a PDF file containing tables to a single Excel workbook",
+    responses={
+        200: {"content": {EXCEL_MEDIA_TYPE: {}}},
+        400: {
+            "description": "Invalid file type or missing file",
+            "content": {"application/json": {"example": {"detail": "Invalid file type. Please upload a PDF."}}},
+        },
+        422: {
+            "description": "No tables detected in the provided PDF",
+            "content": {"application/json": {"example": {"detail": "No tables could be found in the provided PDF."}}},
+        },
+        500: {
+            "description": "Unexpected server error during processing",
+            "content": {"application/json": {"example": {"detail": "An internal error occurred during file processing."}}},
+        },
+    },
+    tags=["conversion"],
+)
+async def convert_pdf_to_excel(pdf_file: UploadFile = File(..., description="The PDF file to convert")) -> StreamingResponse:
+    """
+    Synchronous conversion endpoint:
+    - Accepts a PDF via multipart/form-data (field: pdf_file)
+    - Extracts tables and writes each table to a separate Excel sheet
+    - Streams the .xlsx file back to the client
+    """
+    if pdf_file is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid file type. Please upload a PDF.")
+
+    try:
+        file_bytes = await pdf_file.read()
+    except Exception:
+        logger.exception("Failed to read uploaded file stream.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail="An internal error occurred during file processing.")
+
+    if not file_bytes or not is_probably_pdf(file_bytes):
+        # Strict content-sniffing check for PDFs
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid file type. Please upload a PDF.")
+
+    # Extract tables -> DataFrames
+    try:
+        extracted = extract_tables_from_pdf(file_bytes)
+    except Exception:
+        logger.exception("Unhandled error during PDF parsing and table extraction.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail="An internal error occurred during file processing.")
+
+    if not extracted:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail="No tables could be found in the provided PDF.")
+
+    # Write DataFrames to an in-memory Excel workbook
+    output_buf = io.BytesIO()
+    try:
+        used_sheet_names: set[str] = set()
+        with pd.ExcelWriter(output_buf, engine="openpyxl") as writer:
+            for df, suggested_name in extracted:
+                safe_name = sanitize_sheet_name(suggested_name, used_sheet_names)
+                df.to_excel(writer, index=False, sheet_name=safe_name)
+        output_buf.seek(0)
+    except Exception:
+        logger.exception("Failed creating the Excel workbook.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail="An internal error occurred during file processing.")
+
+    headers = {"Content-Disposition": f'attachment; filename="{ATTACHMENT_FILENAME}"'}
+    return StreamingResponse(iter_bytesio(output_buf), media_type=EXCEL_MEDIA_TYPE, headers=headers)
+
+
+@app.get("/health", tags=["health"])
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+if __name__ == "__main__":
+    # For local development only. In containers, use the Dockerfile CMD.
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
