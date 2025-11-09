@@ -46,17 +46,16 @@ ATTACHMENT_FILENAME = "converted_output.xlsx"
 INVALID_SHEET_CHARS = r'[:\\/*?\[\]]'
 
 # Configurações otimizadas para detecção de tabelas.
-# CORREÇÃO: Removemos 'snap_vertical' e 'snap_horizontal' pois são obsoletos
-# na versão atual do pdfplumber (0.11.4).
-# Aumentamos a tolerância para unir células verticalmente e manter colunas.
+# CORREÇÃO FINAL: Removemos 'join_line_tol', 'snap_vertical' e 'snap_horizontal'
+# pois não são suportados na versão 0.11.4 do pdfplumber.
+# Mantemos a estratégia 'text' e alta tolerância para capturar tabelas complexas.
 TABLE_SETTINGS_OPTIMIZED = {
     "vertical_strategy": "text",   # Usa alinhamento do texto para determinar colunas
     "horizontal_strategy": "text", # Usa alinhamento do texto para determinar linhas
-    "snap_tolerance": 5,           # Aumenta a margem de erro para alinhamento (ajuda colunas desalinhadas como 'Turma')
+    "snap_tolerance": 5,           # Aumenta a margem de erro para alinhamento
     "join_tolerance": 5,           # Aumenta tolerância para unir elementos horizontalmente
-    "join_line_tol": 3,
     "edge_min_length": 3,
-    "min_words_vertical": 2,       # Exige pelo menos 2 palavras para traçar uma linha vertical (evita dividir células com texto longo)
+    "min_words_vertical": 2,       # Exige pelo menos 2 palavras para traçar uma linha vertical
 }
 
 # ------------------------------------------------------------------------------
@@ -192,12 +191,14 @@ def extract_tables_from_pdf(pdf_bytes: bytes) -> List[Tuple[pd.DataFrame, str]]:
 
         for page_index, page in enumerate(pdf.pages, start=1):
             try:
-                # Usa as configurações otimizadas para melhorar a detecção de tabelas
-                # Aumentamos a tolerância e forçamos a estratégia 'text' para unir células
+                # Usa as configurações otimizadas (e compatíveis) para melhorar a detecção de tabelas
                 tables = page.extract_tables(TABLE_SETTINGS_OPTIMIZED) or []
             except Exception as e:
-                logger.exception("Failed to extract tables from page %s: %s", page_index, e)
-                continue
+                logger.exception("Unhandled error during PDF parsing and table extraction.")
+                # Se o erro for de configuração, levantamos uma exceção 500 para não retornar 422
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                    detail=f"Configuration Error in pdfplumber: {e}")
+
 
             for table_index, table in enumerate(tables, start=1):
                 if not table:
@@ -281,6 +282,9 @@ async def convert_pdf_to_excel(pdf_file: UploadFile = File(..., description="The
     # Extract tables -> DataFrames
     try:
         extracted = extract_tables_from_pdf(file_bytes)
+    except HTTPException:
+        # Re-levanta a exceção se ela já foi definida (ex: Configuration Error 500)
+        raise
     except Exception:
         logger.exception("Unhandled error during PDF parsing and table extraction.")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
