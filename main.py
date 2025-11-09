@@ -46,29 +46,23 @@ ATTACHMENT_FILENAME = "converted_output.xlsx"
 INVALID_SHEET_CHARS = r'[:\\/*?\[\]]'
 
 # ATENÇÃO: COORDENADAS FIXAS PARA EXTRAÇÃO ROBUSTA
-# Estas coordenadas (pontos X) definem onde as colunas devem ser cortadas.
-# Elas são a forma mais garantida de capturar colunas desalinhadas como 'Turma'.
-# Valores de exemplo para um documento A4 típico (0 a 600 pontos):
-# Exemplo: [50, 150, 250, 350, 450, 550] - Seis colunas.
-# Por favor, ajuste se o PDF tiver margens ou layouts diferentes.
+# Com base na análise do PDF, a tabela tem 3 colunas de dados.
+# Definimos 4 linhas verticais para criar 3 colunas.
+# As colunas são mais estreitas do que o A4 padrão.
 FIXED_COLUMN_COORDINATES = [
-    50,  # Coluna 1 (Início da primeira coluna)
-    130, # Divisão Coluna 1 / Coluna 2
-    210, # Divisão Coluna 2 / Coluna 3
-    300, # Divisão Coluna 3 / Coluna 4 (Onde estaria a 'Turma'?)
-    420, # Divisão Coluna 4 / Coluna 5
-    500, # Divisão Coluna 5 / Coluna 6
-    550  # Fim da última coluna
+    30,  # Início real da tabela (Nome do Aluno)
+    250, # Fim da Coluna 'Aluno' / Início da Coluna 'Telefone'
+    390, # Fim da Coluna 'Telefone' / Início da Coluna 'Responsável'
+    580  # Fim da Coluna 'Responsável'
 ]
 
 # CONFIGURAÇÃO DE EXTRAÇÃO COMPATÍVEL COM pdfplumber==0.11.8
-# Força o uso das coordenadas X acima como as linhas verticais da tabela.
+# Força o uso das coordenadas X acima.
 TABLE_SETTINGS_V0_11_8 = {
     "explicit_vertical_lines": FIXED_COLUMN_COORDINATES,
-    # 'text' é a estratégia mais tolerante para PDFs sem linhas de grade.
     "vertical_strategy": "text", 
-    "snap_tolerance": 8,
-    "join_tolerance": 8,
+    "snap_tolerance": 5, # Tolerância reduzida para evitar agrupar mais de 3 colunas
+    "join_tolerance": 5,
 }
 
 # ------------------------------------------------------------------------------
@@ -189,7 +183,6 @@ def _pad_or_truncate(row: List[object] | None, size: int) -> List[object]:
         r.extend([None] * (size - len(r)))
     elif len(r) > size:
         r = r[:size]
-        r = r[:size]
     return r
 
 
@@ -199,27 +192,42 @@ def extract_tables_from_pdf(pdf_bytes: bytes) -> List[Tuple[pd.DataFrame, str]]:
     Returns a list of (DataFrame, desired_sheet_name).
     """
     results: List[Tuple[pd.DataFrame, str]] = []
+    
+    # Cabeçalho manual limpo, que corresponde à estrutura real do PDF.
+    # A coluna "Turma" será o nome da sheet e não uma coluna de dados.
+    MANUAL_CLEAN_HEADERS = ["Aluno", "Telefone", "Responsável"]
+    NUM_DATA_COLUMNS = len(MANUAL_CLEAN_HEADERS)
+
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         if not pdf.pages:
             return results
 
         for page_index, page in enumerate(pdf.pages, start=1):
+            
+            # 1. Capturar o nome da Turma (primeira linha da página)
+            # Extrai todo o texto da página e tenta pegar a primeira linha.
+            page_text = page.extract_text(x_tolerance=2)
+            # O nome da turma é geralmente a primeira linha
+            sheet_name_base = "Sheet"
+            if page_text:
+                first_line = page_text.split('\n')[0].strip()
+                # A primeira linha deve ser algo como "3º Segurança" ou "3º Eletrônica 2"
+                if re.match(r"^\dº\s+", first_line):
+                    sheet_name_base = first_line
+
             try:
-                # OTIMIZAÇÃO: Usa a sintaxe legada de 'explicit_vertical_lines'
-                # para forçar o pdfplumber a criar colunas nas coordenadas X definidas.
+                # 2. Extrair a tabela usando coordenadas fixas
                 tables = page.extract_tables(table_settings=TABLE_SETTINGS_V0_11_8) or []
             except Exception as e:
                 logger.exception("Unhandled error during PDF parsing and table extraction.")
-                # Se o erro for de configuração, levantamos uma exceção 500 para não retornar 422
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                                     detail=f"Configuration Error in pdfplumber: {e}")
-
 
             for table_index, table in enumerate(tables, start=1):
                 if not table:
                     continue
 
-                # Filter out fully empty rows
+                # Filter out rows that are completely empty
                 nonempty_rows = [
                     row for row in table
                     if row and any((cell is not None) and str(cell).strip() != "" for cell in row)
@@ -227,24 +235,38 @@ def extract_tables_from_pdf(pdf_bytes: bytes) -> List[Tuple[pd.DataFrame, str]]:
                 if not nonempty_rows:
                     continue
 
-                # Use the first row as header, which is the most practical general assumption.
-                header_raw = [str(c).strip() if c is not None else "" for c in nonempty_rows[0]]
-                header = _dedupe_columns(header_raw)
+                # 3. Limpar dados e montar o DataFrame
+                
+                # O PDF tem um cabeçalho (Aluno, Telefone, Responsável) na linha 1 
+                # e um cabeçalho implícito (com aspas) na linha 2. 
+                # Vamos pular as 1 ou 2 primeiras linhas que são lixo e cabeçalhos.
+                data_rows = nonempty_rows
+                
+                # Se houver mais de 3 linhas, removemos as primeiras 2 que contêm o cabeçalho.
+                if len(data_rows) > 3:
+                     # Remove o cabeçalho "Aluno","Telefone","Responsável" e o cabeçalho da tabela detectado
+                    data_rows = data_rows[2:] 
 
-                # Normalize each row to the header size and build DataFrame
-                normalized_rows = [_pad_or_truncate(row, len(header)) for row in nonempty_rows[1:]]
-                df = pd.DataFrame(normalized_rows, columns=header)
+                # Garante que cada linha tenha o número correto de colunas (3)
+                normalized_rows = [_pad_or_truncate(row, NUM_DATA_COLUMNS) for row in data_rows]
+                
+                # Cria o DataFrame usando o cabeçalho limpo e fixo
+                df = pd.DataFrame(normalized_rows, columns=MANUAL_CLEAN_HEADERS)
 
                 # Clean: drop fully empty rows/columns
                 df.replace(r"^\s*$", pd.NA, regex=True, inplace=True)
                 df.dropna(how="all", inplace=True)
                 df.dropna(axis=1, how="all", inplace=True)
 
-                # If data vanished (rare), keep at least the header-only dataframe
                 if df.empty:
-                    df = pd.DataFrame(columns=header)
+                    continue
 
-                sheet_name = f"Table_{table_index}_Page_{page_index}"
+                # Usa o nome da turma para a sheet
+                sheet_name = sheet_name_base
+                
+                # Adiciona o nome da Turma como a primeira coluna do DataFrame (opcional, se necessário)
+                #df.insert(0, "Turma", sheet_name_base) 
+                
                 results.append((df, sheet_name))
 
     return results
@@ -321,7 +343,7 @@ async def convert_pdf_to_excel(pdf_file: UploadFile = File(..., description="The
     except Exception:
         logger.exception("Failed creating the Excel workbook.")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                            detail="An internal error occurred during file processing.")
+                            detail="An internal error ocorreu durante file processing.")
 
     headers = {"Content-Disposition": f'attachment; filename="{ATTACHMENT_FILENAME}"'}
     return StreamingResponse(iter_bytesio(output_buf), media_type=EXCEL_MEDIA_TYPE, headers=headers)
