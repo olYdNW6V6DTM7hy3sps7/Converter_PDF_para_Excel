@@ -48,7 +48,6 @@ INVALID_SHEET_CHARS = r'[:\\/*?\[\]]'
 # ATENÇÃO: COORDENADAS FIXAS PARA EXTRAÇÃO ROBUSTA
 # Com base na análise do PDF, a tabela tem 3 colunas de dados.
 # Definimos 4 linhas verticais para criar 3 colunas.
-# As colunas são mais estreitas do que o A4 padrão.
 FIXED_COLUMN_COORDINATES = [
     30,  # Início real da tabela (Nome do Aluno)
     250, # Fim da Coluna 'Aluno' / Início da Coluna 'Telefone'
@@ -61,7 +60,7 @@ FIXED_COLUMN_COORDINATES = [
 TABLE_SETTINGS_V0_11_8 = {
     "explicit_vertical_lines": FIXED_COLUMN_COORDINATES,
     "vertical_strategy": "text", 
-    "snap_tolerance": 5, # Tolerância reduzida para evitar agrupar mais de 3 colunas
+    "snap_tolerance": 5, 
     "join_tolerance": 5,
 }
 
@@ -69,14 +68,9 @@ TABLE_SETTINGS_V0_11_8 = {
 # Configuration from Environment
 # ------------------------------------------------------------------------------
 # A variável de ambiente que armazenará os sites permitidos, separados por vírgula.
-# Exemplo: "https://site1.com,https://site2.org,http://localhost:3000"
 ALLOWED_ORIGINS_STRING = os.getenv("ALLOWED_ORIGINS")
 
-# Configura a lista de origens. Se a variável estiver definida, ela é transformada
-# em uma lista de strings. Caso contrário, a lista fica vazia, bloqueando o acesso
-# de qualquer origem cross-origin.
 if ALLOWED_ORIGINS_STRING:
-    # Divide a string por vírgulas e remove espaços em branco (strip)
     origins = [o.strip() for o in ALLOWED_ORIGINS_STRING.split(',') if o.strip()]
 else:
     origins = []
@@ -104,14 +98,12 @@ app = FastAPI(
 # ------------------------------------------------------------------------------
 # Middleware para Gerenciamento de CORS
 # ------------------------------------------------------------------------------
-# Este middleware verifica o cabeçalho 'Origin' da requisição.
-# Se a origem não estiver na lista 'origins', a requisição será bloqueada pelo navegador.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,       # A lista de origens permitidas (lida da variável de ambiente)
-    allow_credentials=True,      # Permite credenciais (cookies, cabeçalhos de autorização)
-    allow_methods=["*"],         # Permite todos os métodos (GET, POST, etc.)
-    allow_headers=["*"],         # Permite todos os cabeçalhos
+    allow_origins=origins,       
+    allow_credentials=True,      
+    allow_methods=["*"],         
+    allow_headers=["*"],         
 )
 
 
@@ -159,9 +151,7 @@ def iter_bytesio(buf: io.BytesIO, chunk_size: int = 1024 * 1024) -> Iterable[byt
 
 
 def _dedupe_columns(names: List[str]) -> List[str]:
-    """
-    Deduplicate column names while preserving order: ["A", "A", ""] -> ["A", "A_2", "Column"]
-    """
+    # Mantido para compatibilidade, mas não usado na nova lógica de extração
     counts: dict[str, int] = {}
     out: List[str] = []
     for raw in names:
@@ -193,10 +183,9 @@ def extract_tables_from_pdf(pdf_bytes: bytes) -> List[Tuple[pd.DataFrame, str]]:
     """
     results: List[Tuple[pd.DataFrame, str]] = []
     
-    # Cabeçalho manual limpo, que corresponde à estrutura real do PDF.
-    # A coluna "Turma" será o nome da sheet e não uma coluna de dados.
-    MANUAL_CLEAN_HEADERS = ["Aluno", "Telefone", "Responsável"]
-    NUM_DATA_COLUMNS = len(MANUAL_CLEAN_HEADERS)
+    # Cabeçalho limpo e FIXO que deve ser usado para todas as sheets.
+    MANUAL_CLEAN_HEADERS = ["Turma", "Aluno", "Telefone", "Responsável"]
+    NUM_DATA_COLUMNS = len(MANUAL_CLEAN_HEADERS) - 1 # Exclui 'Turma' da contagem de dados extraídos
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         if not pdf.pages:
@@ -205,69 +194,75 @@ def extract_tables_from_pdf(pdf_bytes: bytes) -> List[Tuple[pd.DataFrame, str]]:
         for page_index, page in enumerate(pdf.pages, start=1):
             
             # 1. Capturar o nome da Turma (primeira linha da página)
-            # Extrai todo o texto da página e tenta pegar a primeira linha.
             page_text = page.extract_text(x_tolerance=2)
-            # O nome da turma é geralmente a primeira linha
-            sheet_name_base = "Sheet"
+            sheet_name_base = f"Page_{page_index}" # Default seguro
+            class_name = ""
+            
             if page_text:
                 first_line = page_text.split('\n')[0].strip()
-                # A primeira linha deve ser algo como "3º Segurança" ou "3º Eletrônica 2"
-                if re.match(r"^\dº\s+", first_line):
-                    sheet_name_base = first_line
+                # Tenta capturar o nome da turma (e remove a palavra "Propedeutica" que estava sobrando no PDF)
+                match = re.search(r"^\dº\s+(.*)", first_line)
+                if match:
+                    class_name = match.group(1).strip().replace("Propedeutica", "").strip()
+                    sheet_name_base = class_name
+                # Se não encontrar, tenta usar a linha toda (ex: "3º Logística")
+                elif re.match(r"^\dº\s+", first_line):
+                    class_name = first_line
+                    sheet_name_base = class_name
 
             try:
-                # 2. Extrair a tabela usando coordenadas fixas
+                # 2. Extrair a tabela usando coordenadas fixas e sintaxe legada
                 tables = page.extract_tables(table_settings=TABLE_SETTINGS_V0_11_8) or []
             except Exception as e:
                 logger.exception("Unhandled error during PDF parsing and table extraction.")
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                                     detail=f"Configuration Error in pdfplumber: {e}")
 
-            for table_index, table in enumerate(tables, start=1):
-                if not table:
-                    continue
+            # Vamos tratar apenas a primeira tabela detectada, pois a lista é um grande bloco
+            if not tables:
+                continue
+            
+            table = tables[0]
 
-                # Filter out rows that are completely empty
-                nonempty_rows = [
-                    row for row in table
-                    if row and any((cell is not None) and str(cell).strip() != "" for cell in row)
-                ]
-                if not nonempty_rows:
-                    continue
+            # Filter out rows that are completely empty
+            nonempty_rows = [
+                row for row in table
+                if row and any((cell is not None) and str(cell).strip() != "" for cell in row)
+            ]
+            if not nonempty_rows:
+                continue
 
-                # 3. Limpar dados e montar o DataFrame
-                
-                # O PDF tem um cabeçalho (Aluno, Telefone, Responsável) na linha 1 
-                # e um cabeçalho implícito (com aspas) na linha 2. 
-                # Vamos pular as 1 ou 2 primeiras linhas que são lixo e cabeçalhos.
-                data_rows = nonempty_rows
-                
-                # Se houver mais de 3 linhas, removemos as primeiras 2 que contêm o cabeçalho.
-                if len(data_rows) > 3:
-                     # Remove o cabeçalho "Aluno","Telefone","Responsável" e o cabeçalho da tabela detectado
-                    data_rows = data_rows[2:] 
+            # 3. Limpar dados e montar o DataFrame
+            
+            # PULA A PRIMEIRA LINHA: A primeira linha sempre contém o cabeçalho ruidoso ("Aluno","Telefone","Responsável").
+            data_rows = nonempty_rows[1:]
+            
+            if not data_rows:
+                continue # Nada de dados para processar
 
-                # Garante que cada linha tenha o número correto de colunas (3)
-                normalized_rows = [_pad_or_truncate(row, NUM_DATA_COLUMNS) for row in data_rows]
-                
-                # Cria o DataFrame usando o cabeçalho limpo e fixo
-                df = pd.DataFrame(normalized_rows, columns=MANUAL_CLEAN_HEADERS)
+            # Garante que cada linha tenha o número correto de colunas de DADOS (3)
+            normalized_rows = [_pad_or_truncate(row, NUM_DATA_COLUMNS) for row in data_rows]
+            
+            # Cria o DataFrame usando o cabeçalho de 3 colunas (Aluno, Telefone, Responsável)
+            df = pd.DataFrame(normalized_rows, columns=MANUAL_CLEAN_HEADERS[1:])
 
-                # Clean: drop fully empty rows/columns
-                df.replace(r"^\s*$", pd.NA, regex=True, inplace=True)
-                df.dropna(how="all", inplace=True)
-                df.dropna(axis=1, how="all", inplace=True)
+            # Adiciona a coluna 'Turma' (Class Name) como a primeira coluna
+            df.insert(0, "Turma", class_name if class_name else f"Página {page_index}")
+            
+            # Limpeza final
+            df.replace(r"^\s*$", pd.NA, regex=True, inplace=True)
+            df.dropna(how="all", inplace=True)
+            
+            # Se todas as colunas de dados (menos a Turma) estiverem vazias, remove a linha
+            df.dropna(subset=MANUAL_CLEAN_HEADERS[1:], how="all", inplace=True)
 
-                if df.empty:
-                    continue
 
-                # Usa o nome da turma para a sheet
-                sheet_name = sheet_name_base
-                
-                # Adiciona o nome da Turma como a primeira coluna do DataFrame (opcional, se necessário)
-                #df.insert(0, "Turma", sheet_name_base) 
-                
-                results.append((df, sheet_name))
+            # Usa o nome da turma para a sheet
+            # IMPORTANTE: Para consolidar os 129 contatos em um único Excel,
+            # precisamos garantir que os nomes das sheets sejam únicos, mas consistentes.
+            # Vou manter o nome da turma como nome da sheet,
+            # confiando na função sanitize_sheet_name para lidar com duplicatas.
+            results.append((df, sheet_name_base))
 
     return results
 
@@ -336,9 +331,28 @@ async def convert_pdf_to_excel(pdf_file: UploadFile = File(..., description="The
     try:
         used_sheet_names: set[str] = set()
         with pd.ExcelWriter(output_buf, engine="openpyxl") as writer:
-            for df, suggested_name in extracted:
-                safe_name = sanitize_sheet_name(suggested_name, used_sheet_names)
-                df.to_excel(writer, index=False, sheet_name=safe_name)
+            # Novo: Concatena todos os DataFrames em um único DF para a sheet "Geral"
+            # Isso garante que todos os 129 contatos estejam juntos.
+            all_dfs = [df for df, _ in extracted]
+            
+            # Se o usuário quer a 'Turma' como coluna, faz mais sentido ter uma aba "Geral"
+            # com todos os dados, e abas extras por turma (se necessário)
+            # Vamos simplificar para apenas uma aba "Geral" para os 129 contatos.
+            if all_dfs:
+                df_general = pd.concat(all_dfs, ignore_index=True)
+                # Garante que a coluna 'Turma' seja a primeira
+                cols = ['Turma'] + [col for col in df_general.columns if col != 'Turma']
+                df_general = df_general[cols]
+
+                safe_name = sanitize_sheet_name("Geral - Contatos", used_sheet_names)
+                df_general.to_excel(writer, index=False, sheet_name=safe_name)
+            
+            # Se quisermos sheets separadas por turma (como o código anterior faria),
+            # o bloco abaixo é necessário, mas optamos por uma sheet "Geral" para todos os 129.
+            # for df, suggested_name in extracted:
+            #     safe_name = sanitize_sheet_name(suggested_name, used_sheet_names)
+            #     df.to_excel(writer, index=False, sheet_name=safe_name)
+
         output_buf.seek(0)
     except Exception:
         logger.exception("Failed creating the Excel workbook.")
