@@ -46,17 +46,17 @@ ATTACHMENT_FILENAME = "converted_output.xlsx"
 INVALID_SHEET_CHARS = r'[:\\/*?\[\]]'
 
 # Configurações otimizadas para detecção de tabelas.
-# Usa estratégia 'text' para tabelas sem bordas ou com formatação irregular,
-# melhorando a detecção de colunas (como a 'Turma').
+# CORREÇÃO: Removemos 'snap_vertical' e 'snap_horizontal' pois são obsoletos
+# na versão atual do pdfplumber (0.11.4).
+# Aumentamos a tolerância para unir células verticalmente e manter colunas.
 TABLE_SETTINGS_OPTIMIZED = {
-    "vertical_strategy": "text",  # Usa o alinhamento do texto para determinar as colunas
-    "horizontal_strategy": "text", # Usa o alinhamento do texto para determinar as linhas
-    "snap_tolerance": 3,
-    "snap_vertical": None,
-    "snap_horizontal": None,
-    "join_tolerance": 3,
-    "join_line_tol": 2,
+    "vertical_strategy": "text",   # Usa alinhamento do texto para determinar colunas
+    "horizontal_strategy": "text", # Usa alinhamento do texto para determinar linhas
+    "snap_tolerance": 5,           # Aumenta a margem de erro para alinhamento (ajuda colunas desalinhadas como 'Turma')
+    "join_tolerance": 5,           # Aumenta tolerância para unir elementos horizontalmente
+    "join_line_tol": 3,
     "edge_min_length": 3,
+    "min_words_vertical": 2,       # Exige pelo menos 2 palavras para traçar uma linha vertical (evita dividir células com texto longo)
 }
 
 # ------------------------------------------------------------------------------
@@ -193,6 +193,7 @@ def extract_tables_from_pdf(pdf_bytes: bytes) -> List[Tuple[pd.DataFrame, str]]:
         for page_index, page in enumerate(pdf.pages, start=1):
             try:
                 # Usa as configurações otimizadas para melhorar a detecção de tabelas
+                # Aumentamos a tolerância e forçamos a estratégia 'text' para unir células
                 tables = page.extract_tables(TABLE_SETTINGS_OPTIMIZED) or []
             except Exception as e:
                 logger.exception("Failed to extract tables from page %s: %s", page_index, e)
