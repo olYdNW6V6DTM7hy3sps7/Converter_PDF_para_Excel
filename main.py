@@ -61,6 +61,16 @@ FIXED_COLUMN_COORDINATES = [
     550  # Fim da última coluna
 ]
 
+# CONFIGURAÇÃO DE EXTRAÇÃO COMPATÍVEL COM pdfplumber==0.11.8
+# Força o uso das coordenadas X acima como as linhas verticais da tabela.
+TABLE_SETTINGS_V0_11_8 = {
+    "explicit_vertical_lines": FIXED_COLUMN_COORDINATES,
+    # 'text' é a estratégia mais tolerante para PDFs sem linhas de grade.
+    "vertical_strategy": "text", 
+    "snap_tolerance": 8,
+    "join_tolerance": 8,
+}
+
 # ------------------------------------------------------------------------------
 # Configuration from Environment
 # ------------------------------------------------------------------------------
@@ -179,6 +189,7 @@ def _pad_or_truncate(row: List[object] | None, size: int) -> List[object]:
         r.extend([None] * (size - len(r)))
     elif len(r) > size:
         r = r[:size]
+        r = r[:size]
     return r
 
 
@@ -194,9 +205,9 @@ def extract_tables_from_pdf(pdf_bytes: bytes) -> List[Tuple[pd.DataFrame, str]]:
 
         for page_index, page in enumerate(pdf.pages, start=1):
             try:
-                # CORREÇÃO FINAL DE COMPATIBILIDADE:
-                # Passa 'columns' diretamente para a função, em vez de dentro de 'table_settings'.
-                tables = page.extract_tables(columns=FIXED_COLUMN_COORDINATES) or []
+                # OTIMIZAÇÃO: Usa a sintaxe legada de 'explicit_vertical_lines'
+                # para forçar o pdfplumber a criar colunas nas coordenadas X definidas.
+                tables = page.extract_tables(table_settings=TABLE_SETTINGS_V0_11_8) or []
             except Exception as e:
                 logger.exception("Unhandled error during PDF parsing and table extraction.")
                 # Se o erro for de configuração, levantamos uma exceção 500 para não retornar 422
